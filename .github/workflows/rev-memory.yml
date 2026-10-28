@@ -1,0 +1,251 @@
+name: rev-memory
+
+on:
+  push:
+    branches: [rev/server-memory-endpoint]
+  workflow_dispatch:
+
+env:
+  BASE_SHA: 84ae7ea6207a7b8b45b29777e90e6cc4e2cb0a4a
+  ORACLE_URL: https://github.com/tobocop2/llama.cpp/releases/download/build-memory-metrics-release-b10139-b11c3a9/llama-build-memory-metrics-release-b10139-b11c3a9-bin-ubuntu-x64.tar.gz
+  CMAKE_FLAGS: >-
+    -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON
+    -DBUILD_SHARED_LIBS=OFF
+    -DGGML_IQK_FA_ALL_QUANTS=OFF -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_EXAMPLES=ON
+    -DLLAMA_BUILD_SERVER=ON -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        which: [head, base]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.which == 'base' && env.BASE_SHA || github.sha }}
+      - uses: actions/checkout@v4
+        with:
+          path: revtools
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: rev-${{ matrix.which }}
+          max-size: 1G
+      - name: Install packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Build
+        run: |
+          git log -1 --format=%H
+          cmake -B build $CMAKE_FLAGS
+          timeout 4000 cmake --build build --target llama-server test-chat-template -j $(nproc)
+      - name: Install test requirements
+        run: pip install -r examples/server/tests/requirements.txt 'httpx<0.28'
+      - name: Fetch models
+        working-directory: examples/server/tests
+        run: |
+          curl -sSfL --retry 5 -o test-model.gguf https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories260K.gguf
+          curl -sSfL --retry 5 -o tinygemma3-Q8_0.gguf https://huggingface.co/ggml-org/tinygemma3-GGUF/resolve/main/tinygemma3-Q8_0.gguf
+          curl -sSfL --retry 5 -o mmproj-tinygemma3.gguf https://huggingface.co/ggml-org/tinygemma3-GGUF/resolve/main/mmproj-tinygemma3.gguf
+      - name: Results
+        env:
+          LLAMA_SERVER_BIN_PATH: ${{ github.workspace }}/build/bin/llama-server
+        run: |
+          mkdir -p out
+          git log -1 --format=%H > out/sha.txt
+          (cd build && ctest -R test-chat-template --output-on-failure > ../out/chat-template.log 2>&1; echo "ctest rc=$?" >> ../out/chat-template.log) || true
+          cd examples/server/tests
+          timeout 1500 behave --summary --no-capture features/server.feature > ../../../out/server-feature.log 2>&1 || true
+          if [ -f features/memory.feature ]; then
+            timeout 900 behave --summary --no-capture features/memory.feature > ../../../out/memory-feature.log 2>&1 || true
+          fi
+          cd ../../..
+          for f in out/server-feature.log out/memory-feature.log; do
+            [ -f $f ] && { echo "== $f"; grep -E "scenarios? (passed|failed)|steps? (passed|failed)|^Failing scenarios" -A8 $f | tail -n 25; } >> out/summary.txt
+          done
+          cat out/summary.txt
+          tail -n 5 out/chat-template.log
+          cp build/bin/llama-server out/llama-server
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.which }}
+          path: out
+          retention-days: 5
+
+  oracle:
+    needs: build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-head
+          path: bin-head
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-base
+          path: bin-base
+      - name: Fetch oracle and models
+        run: |
+          mkdir -p oracle models out
+          curl -sSfL --retry 5 -o oracle.tgz "$ORACLE_URL"
+          tar -xzf oracle.tgz -C oracle
+          find oracle -name 'llama-server' -type f | tee out/oracle-path.txt
+          chmod +x bin-head/llama-server bin-base/llama-server
+          curl -sSfL --retry 5 -o models/stories.gguf https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories260K.gguf
+          curl -sSfL --retry 5 -o models/gemma.gguf https://huggingface.co/ggml-org/tinygemma3-GGUF/resolve/main/tinygemma3-Q8_0.gguf
+          curl -sSfL --retry 5 -o models/mmproj.gguf https://huggingface.co/ggml-org/tinygemma3-GGUF/resolve/main/mmproj-tinygemma3.gguf
+          curl -sSfL --retry 5 -o models/qwen.gguf https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q8_0.gguf
+          ls -l models
+      - name: Probes
+        run: |
+          set -u
+          W=$PWD
+          H=$W/bin-head/llama-server
+          B=$W/bin-base/llama-server
+          O=$(find $W/oracle -name 'llama-server' -type f | head -n 1)
+          export LD_LIBRARY_PATH=$(dirname "$O")
+          OUT=$W/out
+          P=$W/.github/rev/probe.sh
+          C="-c 4096 -ub 32 -b 32 -np 1"
+          Q=$W/models/qwen.gguf; S=$W/models/stories.gguf; G=$W/models/gemma.gguf; M=$W/models/mmproj.gguf
+          $P h-qwen-ngl0 $H $Q $OUT $C -ngl 0 --memory --metrics
+          $P o-qwen-ngl0 $O $Q $OUT $C -ngl 0 --memory --metrics
+          $P h-qwen-ngl99 $H $Q $OUT $C -ngl 99 --memory --metrics
+          $P o-qwen-ngl99 $O $Q $OUT $C -ngl 99 --memory --metrics
+          $P h-stories $H $S $OUT $C -ngl 0 --memory --metrics
+          $P o-stories $O $S $OUT $C -ngl 0 --memory --metrics
+          $P h-gemma-mmproj $H $G $OUT $C -ngl 0 --mmproj $M --memory --metrics
+          $P o-gemma-mmproj $O $G $OUT $C -ngl 0 --mmproj $M --memory --metrics
+          $P h-gemma-nomm $H $G $OUT $C -ngl 0 --memory --metrics
+          $P o-gemma-nomm $O $G $OUT $C -ngl 0 --memory --metrics
+          $P h-metrics-only $H $Q $OUT $C -ngl 0 --metrics
+          $P b-metrics-only $B $Q $OUT $C -ngl 0 --metrics
+          $P o-metrics-only $O $Q $OUT $C -ngl 0 --metrics
+          $P h-noflags $H $Q $OUT $C -ngl 0
+          $P b-noflags $B $Q $OUT $C -ngl 0
+          $P h-memory-only $H $Q $OUT $C -ngl 0 --memory
+          $P b-memory-only $B $Q $OUT $C -ngl 0 --memory
+          $P o-memory-only $O $Q $OUT $C -ngl 0 --memory
+          $P h-rtr $H $Q $OUT $C -ngl 0 --memory --metrics -rtr
+          $P h-nommap $H $Q $OUT $C -ngl 0 --memory --metrics --no-mmap
+          $P o-nommap $O $Q $OUT $C -ngl 0 --memory --metrics --no-mmap
+          $P h-kvq8 $H $Q $OUT $C -ngl 0 --memory --metrics -ctk q8_0 -ctv q8_0 -fa
+          $P h-ot $H $Q $OUT $C -ngl 99 --memory --metrics -ot ".*ffn.*=CPU"
+          $P h-ctx32k $H $Q $OUT -c 32768 -ub 512 -b 2048 -np 1 -ngl 0 --memory --metrics
+          $P o-ctx32k $O $Q $OUT -c 32768 -ub 512 -b 2048 -np 1 -ngl 0 --memory --metrics
+          $P h-np4 $H $Q $OUT -c 4096 -ub 32 -b 32 -np 4 -ngl 0 --memory --metrics
+          LLAMA_ARG_ENDPOINT_MEMORY=1 $P h-envvar $H $Q $OUT $C -ngl 0
+          LLAMA_ARG_ENDPOINT_MEMORY=1 $P o-envvar $O $Q $OUT $C -ngl 0
+          $W/.github/rev/early.sh h-early $H $Q $OUT $C -ngl 0 --memory || true
+          $W/.github/rev/early.sh o-early $O $Q $OUT $C -ngl 0 --memory || true
+          $W/.github/rev/early.sh h-early-nommap $H $Q $OUT $C -ngl 0 --memory --no-mmap || true
+          $W/.github/rev/conc.sh h-conc $H $Q $OUT -c 4096 -ub 32 -b 32 -np 2 -ngl 0 --memory --metrics || true
+          $W/.github/rev/conc.sh o-conc $O $Q $OUT -c 4096 -ub 32 -b 32 -np 2 -ngl 0 --memory --metrics || true
+      - name: Compare
+        run: |
+          set +e
+          cd out
+          R=$GITHUB_WORKSPACE/.github/rev
+          {
+          for p in qwen-ngl0 qwen-ngl99 stories gemma-mmproj gemma-nomm nommap ctx32k; do
+            echo "##### memory.json head vs oracle: $p"
+            python3 $R/compare.py h-$p/memory.json o-$p/memory.json
+          done
+          echo "##### envvar head vs oracle"
+          python3 $R/compare.py h-envvar/memory.json o-envvar/memory.json
+          for p in qwen-ngl0 qwen-ngl99 stories gemma-mmproj; do
+            echo "##### metrics head vs oracle: $p"
+            diff h-$p/metrics.txt o-$p/metrics.txt
+          done
+          echo "##### metrics --metrics only: head vs base (full diff)"
+          diff b-metrics-only/metrics.txt h-metrics-only/metrics.txt
+          echo "##### metrics --metrics only: head vs oracle"
+          diff h-metrics-only/metrics.txt o-metrics-only/metrics.txt
+          echo "##### status codes"
+          for d in h-noflags b-noflags h-memory-only b-memory-only o-memory-only h-metrics-only b-metrics-only o-metrics-only h-envvar o-envvar; do
+            echo "$d memory=$(cat $d/memory.code) metrics=$(cat $d/metrics.code 2>/dev/null) ready=$(cat $d/ready)"
+          done
+          echo "##### bodies without the flag"
+          for d in h-noflags b-noflags h-memory-only b-memory-only; do echo "-- $d memory:"; head -c 300 $d/memory.json; echo; echo "-- $d metrics:"; head -c 300 $d/metrics.txt; echo; done
+          echo "##### ik specific variants (head only): memory.json"
+          for d in h-rtr h-kvq8 h-ot h-np4 h-nommap h-qwen-ngl0; do echo "-- $d"; cat $d/memory.json; echo; done
+          echo "##### props endpoint_memory"
+          grep -o '"endpoint_memory[^,]*' h-qwen-ngl0/props.json o-qwen-ngl0/props.json b-noflags/props.json h-noflags/props.json
+          echo "##### startup log buffer lines (head)"
+          for d in h-qwen-ngl0 h-qwen-ngl99 h-rtr h-nommap h-kvq8 h-ot h-ctx32k h-np4 h-gemma-mmproj h-stories; do
+            echo "-- $d"; grep -i "buffer size\|buffer =" $d/log.txt
+          done
+          echo "##### startup log buffer lines (oracle)"
+          for d in o-qwen-ngl0 o-ctx32k o-gemma-mmproj; do echo "-- $d"; grep -i "buffer size\|buffer =\|MiB" $d/log.txt | head -n 40; done
+          echo "##### early"
+          for d in h-early o-early h-early-nommap; do echo "-- $d"; cat $d/codes.uniq; done
+          echo "##### conc"
+          for d in h-conc o-conc; do echo "-- $d"; cat $d/summary.txt; done
+          } > diffs.txt 2>&1
+          wc -l diffs.txt
+          rm -f $GITHUB_WORKSPACE/bin-head/llama-server
+      - uses: actions/upload-artifact@v4
+        with:
+          name: oracle-out
+          path: out
+          retention-days: 5
+
+  mutation:
+    needs: build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        arm: [gate, model, context, output, compute, mmproj, gauges, gauges_gated, gauge_double, help_dupe, total_free, host_total, dedup, n_layer, env, mmproj_always, host_row, metrics_task]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: rev-head
+          max-size: 1G
+          save: false
+      - name: Install packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Apply the mutation
+        run: python3 .github/rev/mutate.py ${{ matrix.arm }}
+      - name: Build
+        run: |
+          cmake -B build $CMAKE_FLAGS
+          timeout 4000 cmake --build build --target llama-server -j $(nproc)
+      - name: Install test requirements
+        run: pip install -r examples/server/tests/requirements.txt 'httpx<0.28'
+      - name: Fetch models
+        working-directory: examples/server/tests
+        run: |
+          curl -sSfL --retry 5 -o test-model.gguf https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories260K.gguf
+          curl -sSfL --retry 5 -o tinygemma3-Q8_0.gguf https://huggingface.co/ggml-org/tinygemma3-GGUF/resolve/main/tinygemma3-Q8_0.gguf
+          curl -sSfL --retry 5 -o mmproj-tinygemma3.gguf https://huggingface.co/ggml-org/tinygemma3-GGUF/resolve/main/mmproj-tinygemma3.gguf
+      - name: Memory features
+        working-directory: examples/server/tests
+        env:
+          LLAMA_SERVER_BIN_PATH: ${{ github.workspace }}/build/bin/llama-server
+        run: |
+          mkdir -p ../../../out
+          rc=0
+          timeout 900 behave --summary --no-capture features/memory.feature > ../../../out/behave.log 2>&1 || rc=$?
+          { echo "arm ${{ matrix.arm }} behave rc=$rc"; grep -E "scenarios? (passed|failed)|steps? (passed|failed)|^Failing scenarios" -A8 ../../../out/behave.log | tail -n 20; } > ../../../out/arm.txt
+          cat ../../../out/arm.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arm-${{ matrix.arm }}
+          path: out/arm.txt
+          retention-days: 5
